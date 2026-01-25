@@ -1,0 +1,74 @@
+# wikiKG Configuration
+# This file defines settings for all three knowledge graph pipelines.
+# Each pipeline computes its own PageRank and performs pruning.
+
+# ============================================================
+# Data Sources
+# ============================================================
+dumps:
+  lang: enwiki
+  dump_date: latest
+  raw_dir: data/raw
+
+  # Wikipedia SQL dump files
+  page_sql: data/raw/page.sql.gz
+  pagelinks_sql: data/raw/pagelinks.sql.gz
+  redirect_sql: data/raw/redirect.sql.gz
+  category_sql: data/raw/category.sql.gz
+  categorylinks_sql: data/raw/categorylinks.sql.gz
+
+# ============================================================
+# Pipeline 1: Wikipedia Hyperlink Graph
+# ============================================================
+# Builds a directed graph from page hyperlinks with PageRank scoring.
+# Data source: Wikipedia SQL dumps (page, pagelinks, redirect)
+hyperlink:
+  out_dir: data/graph/hyperlink
+  pruned_dir: data/graph/hyperlink/pruned
+
+  pagerank:
+    damping: 0.85
+    max_iter: 30
+    tol: 1.0e-6
+
+  prune:
+    drop_bottom_pct: 20  # Remove bottom 20% by PageRank
+
+# ============================================================
+# Pipeline 2: Wikipedia Category Hierarchy
+# ============================================================
+# Builds a category tree from Wikipedia's category system.
+# Computes PageRank on the category graph to identify important categories.
+# Data source: Wikipedia SQL dumps (page, category, categorylinks)
+category:
+  out_dir: data/graph/category
+  pruned_dir: data/graph/category/pruned
+
+  pagerank:
+    damping: 0.85
+    max_iter: 30
+    tol: 1.0e-6
+
+  prune:
+    drop_bottom_pct: 20  # Remove bottom 20% by PageRank
+
+# ============================================================
+# Pipeline 3: WordNet Semantic Hierarchy
+# ============================================================
+# Builds a semantic hierarchy from WordNet hypernyms.
+# Computes PageRank on the WordNet graph to identify important synsets.
+# Data source: NLTK WordNet corpus (NOT Wikipedia)
+wordnet:
+  tags_file: data/tags.txt
+  out_dir: data/graph/wordnet
+  pruned_dir: data/graph/wordnet/pruned
+  max_depth: 5
+  all_senses: false
+
+  pagerank:
+    damping: 0.85
+    max_iter: 30
+    tol: 1.0e-6
+
+  prune:
+    drop_bottom_pct: 20  # Remove bottom 20% by PageRank
