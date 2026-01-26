@@ -12,10 +12,9 @@ Data sources:
 Note: This pipeline does NOT use Wikipedia data.
 """
 
-from .build_graph import load_tags, build_graph, ensure_wordnet
+from .build_graph import build_graph, ensure_wordnet
 
 __all__ = [
-    "load_tags",
     "build_graph",
     "ensure_wordnet",
 ]

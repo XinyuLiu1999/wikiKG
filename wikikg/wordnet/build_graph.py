@@ -5,6 +5,7 @@ import os
 import sys
 
 import pyarrow as pa
+from tqdm import tqdm   # ← 新增
 
 from wikikg.common import ParquetBatchWriter
 
@@ -59,7 +60,7 @@ def build_graph(pos=None):
     node_ids = {}
     nodes = []
 
-    for synset in all_synsets:
+    for synset in tqdm(all_synsets, desc="Building nodes"):
         name = synset.name()
         node_id = len(node_ids)
         node_ids[name] = node_id
@@ -70,7 +71,7 @@ def build_graph(pos=None):
     # Build edges (hypernym -> hyponym)
     edges_set = set()
 
-    for synset in all_synsets:
+    for synset in tqdm(all_synsets, desc="Building edges"):
         child_id = node_ids[synset.name()]
 
         # Add edges from each hypernym to this synset
@@ -78,7 +79,7 @@ def build_graph(pos=None):
             parent_id = node_ids[hypernym.name()]
             edges_set.add((parent_id, child_id))
 
-        # Also include instance hypernyms (e.g., "Einstein" is instance of "physicist")
+        # Also include instance hypernyms
         for hypernym in synset.instance_hypernyms():
             parent_id = node_ids[hypernym.name()]
             edges_set.add((parent_id, child_id))
@@ -95,12 +96,15 @@ def write_parquet(path, schema, rows, batch_size=100000):
     """Write rows to Parquet file in batches."""
     with ParquetBatchWriter(path, schema) as writer:
         batch_cols = {name: [] for name in schema.names}
-        for row in rows:
+
+        for row in tqdm(rows, desc=f"Writing {os.path.basename(path)}"):
             for name, value in zip(schema.names, row):
                 batch_cols[name].append(value)
+
             if len(next(iter(batch_cols.values()))) >= batch_size:
                 writer.write(batch_cols)
                 batch_cols = {name: [] for name in schema.names}
+
         if batch_cols and len(next(iter(batch_cols.values()))) > 0:
             writer.write(batch_cols)
 

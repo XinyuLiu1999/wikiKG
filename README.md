@@ -58,7 +58,7 @@ pip install -r requirements.txt
 Download these files to `data/raw/`:
 
 ```bash
-./scripts/download_dumps.sh 20240101 enwiki data/raw
+./scripts/download_dumps.sh 20260101 enwiki data/raw
 ```
 
 ---
