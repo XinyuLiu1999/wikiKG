@@ -1,0 +1,1 @@
+This folder aims to create an alternative knowledge graph specifically for generating world knowledge data

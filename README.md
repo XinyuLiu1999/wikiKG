@@ -131,11 +131,13 @@ categorylinks.sql.gz ─┘                       wiki_category_edges.parquet
 
 Or step by step:
 ```bash
+# Parse categories (with parallel processing)
 python -m wikikg.category.parse_categories \
   --page-sql data/raw/page.sql.gz \
   --category-sql data/raw/category.sql.gz \
   --categorylinks-sql data/raw/categorylinks.sql.gz \
-  --out-dir data/graph/category
+  --out-dir data/graph/category \
+  --workers 8
 
 python -m wikikg.category.compute_pagerank \
   --categories data/graph/category/wiki_categories.parquet \
@@ -284,6 +286,21 @@ python -m wikikg.wordnet.prune_graph \
 - All pipelines use the same PageRank algorithm with configurable parameters
 - The parser only keeps main-namespace pages (namespace=0)
 - Redirects are resolved so edges point to canonical target pages
+
+### Parallel Processing Options
+
+The category parser supports parallel processing for faster parsing of large dumps:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--workers N` | cpu_count - 1 | Number of parallel workers |
+| `--no-pigz` | false | Disable pigz (uses Python gzip instead) |
+
+For best performance, install `pigz` for parallel decompression:
+```bash
+apt install pigz  # Ubuntu/Debian
+brew install pigz # macOS
+```
 
 ## License
 

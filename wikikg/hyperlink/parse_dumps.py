@@ -1,220 +1,189 @@
-"""Parse Wikipedia SQL dumps to extract hyperlink graph."""
-
 import argparse
 import os
+import subprocess
 import sys
-
+from multiprocessing import Pool, cpu_count
 import pyarrow as pa
+from tqdm import tqdm
 
+# 依赖 Common 工具函数
 from wikikg.common import ParquetBatchWriter, iter_insert_tuples, to_int, to_str
 
+# --- 全局变量：用于子进程共享内存 ---
+_worker_title_to_id = None
+_worker_redirect_map = None
+_worker_id_to_title = None
+_worker_ltid_to_title = None
 
-def log(msg):
-    print(msg, file=sys.stderr, flush=True)
+def _init_worker(title_to_id, redirect_map, id_to_title, ltid_to_title):
+    global _worker_title_to_id, _worker_redirect_map, _worker_id_to_title, _worker_ltid_to_title
+    _worker_title_to_id = title_to_id
+    _worker_redirect_map = redirect_map
+    _worker_id_to_title = id_to_title
+    _worker_ltid_to_title = ltid_to_title
 
+class ByteProgressReader:
+    """监控底层解压流字节进度的包装器"""
+    def __init__(self, fileobj, pbar):
+        self.fileobj = fileobj
+        self.pbar = pbar
 
-def build_page_maps(page_sql, max_pages=None):
-    """Build page ID <-> title mappings from page.sql.gz.
+    def read(self, size=-1):
+        chunk = self.fileobj.read(size)
+        self.pbar.update(len(chunk))
+        return chunk
 
-    Only keeps main namespace (ns=0) pages.
+    def __iter__(self):
+        for line in self.fileobj:
+            self.pbar.update(len(line))
+            yield line
 
-    Returns:
-        tuple: (id_to_title dict, title_to_id dict)
-    """
-    id_to_title = {}
-    title_to_id = {}
-    count = 0
+def open_decompressed(path, pbar):
+    """支持 pigz 并行解压"""
+    try:
+        proc = subprocess.Popen(["pigz", "-dc", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        proc = subprocess.Popen(["gzip", "-dc", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return proc, ByteProgressReader(proc.stdout, pbar)
 
-    for fields in iter_insert_tuples(page_sql, "page"):
-        page_id = to_int(fields[0])
-        ns = to_int(fields[1])
-        title = to_str(fields[2])
-        if page_id is None or ns is None or title is None:
-            continue
-        if ns != 0:
-            continue
-        id_to_title[page_id] = title
-        title_to_id[title] = page_id
-        count += 1
-        if max_pages is not None and count >= max_pages:
-            break
-        if count % 1_000_000 == 0:
-            log(f"page: loaded {count} main-namespace pages")
+# --- 核心加载逻辑 ---
 
+def load_linktarget_map(lt_sql):
+    ltid_to_title = {}
+    total_size = os.path.getsize(lt_sql)
+    
+    with tqdm(total=total_size, unit='B', unit_scale=True, desc="1/4 Loading LinkTargets") as pbar:
+        # 1. 这里启动外部解压
+        proc, reader = open_decompressed(lt_sql, pbar)
+        try:
+            # 2. 将解压后的 reader 传给解析函数
+            for fields in iter_insert_tuples(reader, "linktarget"):
+                lt_id = to_int(fields[0])
+                ns = to_int(fields[1])
+                title = to_str(fields[2])
+                if ns == 0:
+                    ltid_to_title[lt_id] = title
+        finally:
+            proc.terminate() # 确保关闭子进程
+    return ltid_to_title
+
+def build_page_maps(page_sql):
+    id_to_title, title_to_id = {}, {}
+    total_size = os.path.getsize(page_sql)
+    with tqdm(total=total_size, unit='B', unit_scale=True, desc="2/4 Loading Pages") as pbar:
+        proc, reader = open_decompressed(page_sql, pbar)
+        for fields in iter_insert_tuples(reader, "page"):
+            pid, ns, title = to_int(fields[0]), to_int(fields[1]), to_str(fields[2])
+            if ns == 0:
+                id_to_title[pid] = title
+                title_to_id[title] = pid
+        proc.wait()
     return id_to_title, title_to_id
 
-
-def build_redirect_map(redirect_sql, title_to_id, max_redirects=None):
-    """Build redirect source -> target mapping from redirect.sql.gz.
-
-    Only keeps main namespace (ns=0) redirects.
-
-    Returns:
-        dict: source_id -> target_id mapping
-    """
+def build_redirect_map(redirect_sql, title_to_id):
     redirect_map = {}
-    count = 0
-
-    for fields in iter_insert_tuples(redirect_sql, "redirect"):
-        rd_from = to_int(fields[0])
-        rd_namespace = to_int(fields[1])
-        rd_title = to_str(fields[2])
-        if rd_from is None or rd_namespace is None or rd_title is None:
-            continue
-        if rd_namespace != 0:
-            continue
-        target_id = title_to_id.get(rd_title)
-        if target_id is None:
-            continue
-        redirect_map[rd_from] = target_id
-        count += 1
-        if max_redirects is not None and count >= max_redirects:
-            break
-        if count % 1_000_000 == 0:
-            log(f"redirect: loaded {count} entries")
-
+    total_size = os.path.getsize(redirect_sql)
+    with tqdm(total=total_size, unit='B', unit_scale=True, desc="3/4 Loading Redirects") as pbar:
+        proc, reader = open_decompressed(redirect_sql, pbar)
+        for fields in iter_insert_tuples(reader, "redirect"):
+            rd_from, rd_ns, rd_title = to_int(fields[0]), to_int(fields[1]), to_str(fields[2])
+            if rd_ns == 0:
+                target_id = title_to_id.get(rd_title)
+                if target_id: redirect_map[rd_from] = target_id
+        proc.wait()
     return redirect_map
 
+# --- 并行处理逻辑 ---
 
-def resolve_redirect(target_id, redirect_map, max_hops=10):
-    """Resolve redirect chains up to max_hops.
-
-    Args:
-        target_id: Starting page ID
-        redirect_map: source_id -> target_id mapping
-        max_hops: Maximum chain length to follow
-
-    Returns:
-        Final target page ID
-    """
-    hops = 0
-    while target_id in redirect_map and hops < max_hops:
-        target_id = redirect_map[target_id]
-        hops += 1
-    return target_id
-
-
-def write_nodes(id_to_title, out_path, batch_size=1_000_000):
-    """Write nodes to Parquet file."""
-    schema = pa.schema([
-        ("page_id", pa.int64()),
-        ("title", pa.string()),
-    ])
-
-    with ParquetBatchWriter(out_path, schema) as writer:
-        batch_ids = []
-        batch_titles = []
-
-        for page_id, title in id_to_title.items():
-            batch_ids.append(page_id)
-            batch_titles.append(title)
-            if len(batch_ids) >= batch_size:
-                writer.write({"page_id": batch_ids, "title": batch_titles})
-                batch_ids = []
-                batch_titles = []
-
-        if batch_ids:
-            writer.write({"page_id": batch_ids, "title": batch_titles})
-
-
-def write_edges(
-    pagelinks_sql,
-    title_to_id,
-    redirect_map,
-    id_to_title,
-    out_path,
-    batch_size=2_000_000,
-    max_edges=None,
-):
-    """Write edges to Parquet file.
-
-    Resolves redirects and filters invalid edges.
-    """
-    schema = pa.schema([
-        ("src_id", pa.int64()),
-        ("dst_id", pa.int64()),
-    ])
-
-    with ParquetBatchWriter(out_path, schema) as writer:
-        batch_src = []
-        batch_dst = []
-        count = 0
-
-        for fields in iter_insert_tuples(pagelinks_sql, "pagelinks"):
+def _process_chunk_worker(chunk):
+    """2026 Schema 修正版：索引对齐 pl_from(0), pl_from_ns(1), pl_target_id(2)"""
+    batch_src, batch_dst = [], []
+    for fields in chunk:
+        try:
+            # 2026 关键索引修复
             pl_from = to_int(fields[0])
-            pl_namespace = to_int(fields[1])
-            pl_title = to_str(fields[2])
+            pl_from_ns = to_int(fields[1]) 
+            pl_target_id = to_int(fields[2]) # 必须是索引 2
 
-            if pl_from is None or pl_namespace is None or pl_title is None:
-                continue
-            if pl_namespace != 0:
-                continue
-            if pl_from not in id_to_title:
+            # 过滤：我们只关心从百科条目（NS=0）发出的链接
+            if pl_from_ns != 0:
                 continue
 
-            dst_id = title_to_id.get(pl_title)
+            # 1. 通过 Linktarget 找到目标标题
+            target_title = _worker_ltid_to_title.get(pl_target_id)
+            if not target_title:
+                continue
+
+            # 2. 映射标题到 Page ID
+            dst_id = _worker_title_to_id.get(target_title)
             if dst_id is None:
                 continue
-            dst_id = resolve_redirect(dst_id, redirect_map)
-            if dst_id not in id_to_title:
-                continue
 
-            batch_src.append(pl_from)
-            batch_dst.append(dst_id)
-            count += 1
-            if max_edges is not None and count >= max_edges:
-                break
+            # 3. 解析重定向
+            dst_id = _worker_redirect_map.get(dst_id, dst_id)
+            
+            # 4. 验证：源和目标都在我们的 nodes 范围内
+            if pl_from in _worker_id_to_title and dst_id in _worker_id_to_title:
+                batch_src.append(pl_from)
+                batch_dst.append(dst_id)
+        except (IndexError, ValueError):
+            continue
+    return batch_src, batch_dst
 
-            if len(batch_src) >= batch_size:
-                writer.write({"src_id": batch_src, "dst_id": batch_dst})
-                batch_src = []
-                batch_dst = []
-                log(f"pagelinks: wrote {count} edges")
-
-        if batch_src:
-            writer.write({"src_id": batch_src, "dst_id": batch_dst})
-
-    log(f"pagelinks: total edges written {count}")
-
+def write_edges_parallel(pagelinks_sql, title_to_id, redirect_map, id_to_title, ltid_to_title, out_path, num_workers=None):
+    if num_workers is None: num_workers = max(1, cpu_count() - 1)
+    schema = pa.schema([("src_id", pa.int64()), ("dst_id", pa.int64())])
+    writer = ParquetBatchWriter(out_path, schema)
+    
+    total_size = os.path.getsize(pagelinks_sql)
+    with tqdm(total=total_size, unit='B', unit_scale=True, desc="4/4 Parsing Pagelinks (2026)") as pbar:
+        proc, reader = open_decompressed(pagelinks_sql, pbar)
+        with Pool(processes=num_workers, initializer=_init_worker, 
+                  initargs=(title_to_id, redirect_map, id_to_title, ltid_to_title)) as pool:
+            chunk, futures = [], []
+            for fields in iter_insert_tuples(reader, "pagelinks"):
+                chunk.append(fields)
+                if len(chunk) >= 100000:
+                    futures.append(pool.apply_async(_process_chunk_worker, (chunk,)))
+                    chunk = []
+                    if len(futures) >= num_workers * 2:
+                        for f in futures:
+                            s, d = f.get()
+                            if s: writer.write({"src_id": s, "dst_id": d})
+                        futures = []
+            if chunk: futures.append(pool.apply_async(_process_chunk_worker, (chunk,)))
+            for f in futures:
+                s, d = f.get()
+                if s: writer.write({"src_id": s, "dst_id": d})
+        writer.close()
+        proc.wait()
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Parse Wikipedia SQL dumps into hyperlink graph"
-    )
-    parser.add_argument("--page-sql", required=True, help="Path to page.sql.gz")
-    parser.add_argument("--pagelinks-sql", required=True, help="Path to pagelinks.sql.gz")
-    parser.add_argument("--redirect-sql", required=True, help="Path to redirect.sql.gz")
-    parser.add_argument("--out-dir", required=True, help="Output directory")
-    parser.add_argument("--max-pages", type=int, help="Limit number of pages")
-    parser.add_argument("--max-redirects", type=int, help="Limit number of redirects")
-    parser.add_argument("--max-edges", type=int, help="Limit number of edges")
+    parser = argparse.ArgumentParser(description="Wikipedia 2026 Hyperlink Graph Parser")
+    parser.add_argument("--page-sql", required=True)
+    parser.add_argument("--linktarget-sql", required=True, help="New for 2026")
+    parser.add_argument("--pagelinks-sql", required=True)
+    parser.add_argument("--redirect-sql", required=True)
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--workers", type=int, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    nodes_path = os.path.join(args.out_dir, "nodes.parquet")
-    edges_path = os.path.join(args.out_dir, "edges.parquet")
+    
+    # 执行流水线
+    ltid_to_title = load_linktarget_map(args.linktarget_sql)
+    id_to_title, title_to_id = build_page_maps(args.page_sql)
+    redirect_map = build_redirect_map(args.redirect_sql, title_to_id)
+    
+    # 保存节点
+    pa.parquet.write_table(pa.Table.from_pydict({
+        "page_id": list(id_to_title.keys()), 
+        "title": list(id_to_title.values())
+    }), os.path.join(args.out_dir, "nodes.parquet"))
 
-    log("building page maps...")
-    id_to_title, title_to_id = build_page_maps(args.page_sql, args.max_pages)
-    log(f"main-namespace pages: {len(id_to_title)}")
-
-    log("building redirect map...")
-    redirect_map = build_redirect_map(args.redirect_sql, title_to_id, args.max_redirects)
-    log(f"redirect entries: {len(redirect_map)}")
-
-    log("writing nodes.parquet...")
-    write_nodes(id_to_title, nodes_path)
-
-    log("writing edges.parquet...")
-    write_edges(
-        args.pagelinks_sql,
-        title_to_id,
-        redirect_map,
-        id_to_title,
-        edges_path,
-        max_edges=args.max_edges,
-    )
-
+    # 并行处理边
+    write_edges_parallel(args.pagelinks_sql, title_to_id, redirect_map, id_to_title, ltid_to_title, 
+                         os.path.join(args.out_dir, "edges.parquet"), num_workers=args.workers)
 
 if __name__ == "__main__":
     main()

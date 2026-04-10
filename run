@@ -1,0 +1,93 @@
+python wikikg/category/query_KG_wikicat.py \
+    --word "Contents" \
+    --nodes data/graph/category/wiki_categories.parquet \
+    --edges data/graph/category/wiki_category_edges.parquet \
+    --depth 3
+
+python -m wikikg.hyperlink.parse_dumps \
+    --page-sql data/raw/page.sql.gz \
+    --linktarget-sql data/raw/linktarget.sql.gz \
+    --pagelinks-sql data/raw/pagelinks.sql.gz \
+    --redirect-sql data/raw/redirect.sql.gz \
+    --out-dir data/graph/hyperlink \
+    --workers 7
+
+# mini pipeline
+zcat data/raw/page.sql.gz | head -n 100000 | gzip > data/raw/mini-page.sql.gz
+zcat data/raw/linktarget.sql.gz | head -n 100000 | gzip > data/raw/mini-linktarget.sql.gz
+zcat data/raw/redirect.sql.gz | head -n 100000 | gzip > data/raw/mini-redirect.sql.gz
+zcat data/raw/pagelinks.sql.gz | head -n 100000 | gzip > data/raw/mini-pagelinks.sql.gz
+
+python -m wikikg.hyperlink.parse_dumps \
+    --page-sql data/raw/mini-page.sql.gz \
+    --linktarget-sql data/raw/mini-linktarget.sql.gz \
+    --redirect-sql data/raw/mini-redirect.sql.gz \
+    --pagelinks-sql data/raw/mini-pagelinks.sql.gz \
+    --out-dir ./test_output \
+    --workers 7
+
+# hyperlink pipeline
+python -m wikikg.hyperlink.parse_dumps \
+    --page-sql data/raw/page.sql.gz \
+    --linktarget-sql data/raw/linktarget.sql.gz \
+    --pagelinks-sql data/raw/pagelinks.sql.gz \
+    --redirect-sql data/raw/redirect.sql.gz \
+    --out-dir data/graph/hyperlink \
+    --workers 7
+
+python wikikg/hyperlink/compute_pagerank.py \ 
+    --nodes data/graph/hyperlink/nodes.parquet \
+    --edges data/graph/hyperlink/edges.parquet \
+    --out data/graph/hyperlink/pagerank.parquet \
+    --stats \
+    --exclude-titles /cephfs/liuxinyu/wikiKG/data/graph/hyperlink/exclude_titles.txt
+
+python wikikg/hyperlink/query_pagerank.py --nodes data/graph/hyperlink/nodes.parquet --pagerank data/graph/hyperlink/pagerank.parquet --title Dog
+
+python wikikg/hyperlink/filter_by_pagerank.py \
+    --nodes data/graph/hyperlink/nodes.parquet \
+    --edges data/graph/hyperlink/edges.parquet \
+    --pagerank data/graph/hyperlink/pagerank.parquet \
+    --out-nodes data/graph/hyperlink/nodes_filtered.parquet \
+    --out-edges data/graph/hyperlink/edges_filtered.parquet \
+    --percentile 99
+
+# python wikikg/common/join_category_hyperlink.py \
+#     --nodes data/graph/hyperlink/nodes_filtered.parquet \
+#     --page-categories data/graph/category/wiki_page_categories.parquet \
+#     --categories data/graph/category/wiki_categories.parquet \
+#     --out-visual data/graph/hyperlink/nodes_visual.parquet \
+#     --out-uncertain data/graph/hyperlink/nodes_uncertain.parquet \
+#     --out-all data/graph/hyperlink/nodes_classified.parquet \
+#     --workers 16
+
+export DASHSCOPE_API_KEY="REDACTED_DASHSCOPE_KEY"
+export GEMINI_API_KEY="REDACTED_GEMINI_KEY"
+python wikikg/hyperlink/classify_llm.py \
+    --nodes data/graph/hyperlink/nodes_filtered.parquet \
+    --out-visual data/graph/hyperlink/nodes_visual.parquet \
+    --out-nonvisual data/graph/hyperlink/nodes_nonvisual.parquet \
+    --out-failed data/graph/hyperlink/nodes_failed.parquet \
+    --model gemini-3-flash-preview \
+    --batch-size 30 \
+    --workers 16 
+
+python tests/semantic_graph/classify_llm.py \
+    --nodes tests/semantic_graph/nodes.parquet \
+    --out-visual tests/semantic_graph/nodes_visual_depth789.parquet \
+    --out-nonvisual tests/semantic_graph/nodes_nonvisual_depth789.parquet \
+    --out-failed tests/semantic_graph/nodes_failed_depth789.parquet \
+    --model qwen-plus \
+    --batch-size 10 \
+    --workers 8 
+
+python wikikg/hyperlink/build_knowledge_graph.py \
+    --visual-nodes data/graph/hyperlink/nodes_visual.parquet \
+    --page-categories data/graph/category/wiki_page_categories.parquet \
+    --categories data/graph/category/wiki_categories.parquet \
+    --category-edges data/graph/category/wiki_category_edges.parquet \
+    --out-dir data/knowledge_graph \
+    --max-depth 5
+
+python wikikg/hyperlink/validate_knowledge_graph.py data/knowledge_graph_clean/
+python wikikg/hyperlink/clean_knowledge_graph.py data/knowledge_graph/ data/knowledge_graph_clean/

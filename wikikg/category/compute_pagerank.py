@@ -38,12 +38,11 @@ def main():
     log(f"categories: {len(category_ids)}")
 
     log("loading category edges...")
-    # Category edges are (parent_id, child_id), we treat parent->child as the edge direction
     rows, cols = load_edges_generic(
         args.edges,
         id_to_index,
-        src_column="parent_id",
-        dst_column="child_id",
+        src_column="child_id",  # 原来是 parent_id
+        dst_column="parent_id",  # 原来是 child_id
         batch_size=args.edge_batch,
     )
     log(f"edges: {len(rows)}")
@@ -73,3 +72,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+# python -m wikikg.category.compute_pagerank \
+#   --categories data/graph/category/wiki_categories.parquet \
+#   --edges data/graph/category/wiki_category_edges.parquet \
+#   --out data/graph/category/category_pagerank.parquet
+# python -c "import pandas as pd; df = pd.read_parquet('data/graph/category/category_pagerank.parquet').merge(pd.read_parquet('data/graph/category/wiki_categories.parquet'), on='category_id'); print(df.sort_values('pagerank', ascending=True).head(10)[['title', 'pagerank']])"
