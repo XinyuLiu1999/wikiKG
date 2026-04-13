@@ -61,8 +61,8 @@ python wikikg/hyperlink/filter_by_pagerank.py \
 #     --out-all data/graph/hyperlink/nodes_classified.parquet \
 #     --workers 16
 
-export DASHSCOPE_API_KEY="REDACTED_DASHSCOPE_KEY"
-export GEMINI_API_KEY="REDACTED_GEMINI_KEY"
+export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY is not set}"
+export GEMINI_API_KEY="${GEMINI_API_KEY:?GEMINI_API_KEY is not set}"
 python wikikg/hyperlink/classify_llm.py \
     --nodes data/graph/hyperlink/nodes_filtered.parquet \
     --out-visual data/graph/hyperlink/nodes_visual.parquet \
